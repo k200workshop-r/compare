@@ -20,11 +20,22 @@ import difflib  # noqa: F401  (保留，之後若要做兩兩 diff 可用)
 import io
 import logging
 import re
+import tempfile
 import unicodedata
+import urllib.request
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pdfplumber
 import streamlit as st
+
+# 產生總比較 PDF 用的繁中字型（雲端首次產生時自動下載並快取內嵌）
+FONT_URL = "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/Variable/TTF/Subset/NotoSansTC-VF.ttf"
+try:
+    LOCAL_FONT = Path(__file__).parent / "NotoSansTC-VF.ttf"
+except NameError:  # 少數執行環境沒有 __file__
+    LOCAL_FONT = Path("NotoSansTC-VF.ttf")
 
 # ---------------------------------------------------------------------------
 # 區段標題（依你的 PDF 內容調整這三行即可）
@@ -101,6 +112,23 @@ def body_lines(body: str) -> list[str]:
     return [ln.rstrip() for ln in body.splitlines() if ln.strip()]
 
 
+def split_depts(raw: str) -> list[str]:
+    return [d.strip() for d in re.split(r"[、,，/／;；\s]+", raw) if d.strip()]
+
+
+def extract_meta(text: str) -> dict[str, Any]:
+    """擷取組別名稱與組成科別。"""
+    name = ""
+    m = re.search(r"紀錄\s*\n\s*([^\n]+)", text)
+    if m:
+        name = m.group(1).strip()
+    depts_raw = ""
+    m2 = re.search(r"組成科別[：:]\s*([^\n]+)", text)
+    if m2:
+        depts_raw = m2.group(1).strip()
+    return {"name": name, "depts_raw": depts_raw, "depts": split_depts(depts_raw)}
+
+
 def build_multi_rows(
     per_file_sessions: list[dict[str, dict[str, str]]],
     raw_sections: list[str],
@@ -147,6 +175,11 @@ def analyze_multi(files: list[tuple[str, bytes]]) -> dict[str, Any]:
     names = [n for n, _ in files]
     texts = [extract_pdf_text(c) for _, c in files]
 
+    metas = [extract_meta(t) for t in texts]
+    dept_bodies = ["\n".join(mt["depts"]) for mt in metas]
+    dept_per_file = [{"科部": {"title": "", "body": b}} if b else {} for b in dept_bodies]
+    dept_rows = build_multi_rows(dept_per_file, dept_bodies)
+
     ans_raw = [section_between(t, SECTION_ANSWERS, [SECTION_AI]) for t in texts]
     ai_raw = [section_between(t, SECTION_AI, [SECTION_TEACHER]) for t in texts]
 
@@ -155,6 +188,8 @@ def analyze_multi(files: list[tuple[str, bytes]]) -> dict[str, Any]:
 
     return {
         "names": names,
+        "meta": metas,
+        "depts": dept_rows,
         "answers": ans_rows,
         "ai": ai_rows,
         "raw": {"answers": ans_raw, "ai": ai_raw},
@@ -168,9 +203,9 @@ def esc(value: str) -> str:
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def render_col_html(col: dict[str, Any], tint: str) -> str:
+def render_col_html(col: dict[str, Any], tint: str, missing_text: str = "（此檔無此 Session）") -> str:
     if col["missing"]:
-        return "<div style='color:#b00;padding:8px;font-style:italic'>（此檔無此 Session）</div>"
+        return f"<div style='color:#b00;padding:8px;font-style:italic'>{esc(missing_text)}</div>"
     if not col["lines"]:
         return "<div style='color:#888;padding:8px'>（空白）</div>"
     out = []
@@ -210,6 +245,122 @@ def show_section(title: str, rows: list[dict[str, Any]], names: list[str], key_p
                     )
                     tint = COL_TINTS[i % len(COL_TINTS)]
                     st.markdown(render_col_html(r["cols"][i], tint), unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# 產生「總比較 PDF」
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def register_report_font() -> str:
+    """回傳可用的字型名稱。優先內嵌 TTF（任何檢視器都能顯示中文），失敗才退回 CID。"""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+    # 1) repo 內若有附字型檔就直接用
+    try:
+        if LOCAL_FONT.exists():
+            pdfmetrics.registerFont(TTFont("TCReport", str(LOCAL_FONT)))
+            return "TCReport"
+    except Exception:  # noqa: BLE001
+        pass
+    # 2) 從網路下載並內嵌（雲端可連外）
+    try:
+        data = urllib.request.urlopen(FONT_URL, timeout=40).read()
+        tmp = tempfile.NamedTemporaryFile(suffix=".ttf", delete=False)
+        tmp.write(data)
+        tmp.close()
+        pdfmetrics.registerFont(TTFont("TCReport", tmp.name))
+        return "TCReport"
+    except Exception:  # noqa: BLE001
+        pass
+    # 3) 退回內建 CID 字型（Chrome / Acrobat / 預覽程式可顯示）
+    pdfmetrics.registerFont(UnicodeCIDFont("MSung-Light"))
+    return "MSung-Light"
+
+
+def build_pdf_report(result: dict[str, Any]) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+
+    font = register_report_font()
+    names = result["names"]
+
+    body = ParagraphStyle("body", fontName=font, fontSize=9, leading=13)
+    name_s = ParagraphStyle("name", fontName=font, fontSize=9, leading=13)
+    h1 = ParagraphStyle("h1", fontName=font, fontSize=16, leading=20, spaceAfter=4)
+    h2 = ParagraphStyle("h2", fontName=font, fontSize=13, leading=17, spaceBefore=12,
+                        spaceAfter=4, textColor=colors.HexColor("#1d6f68"))
+    sess = ParagraphStyle("sess", fontName=font, fontSize=10.5, leading=14, spaceBefore=7, spaceAfter=2)
+    small = ParagraphStyle("small", fontName=font, fontSize=8, leading=12, textColor=colors.HexColor("#666666"))
+
+    story: list[Any] = []
+    story.append(Paragraph("AI 臨床訓練 PDF Session 總比較", h1))
+    story.append(Paragraph(f"比較檔案（共 {len(names)} 份）：" + "　｜　".join(esc(n) for n in names), small))
+    story.append(Paragraph("產生時間：" + datetime.now().strftime("%Y-%m-%d %H:%M"), small))
+    a_ch = sum(1 for r in result["answers"] if r["changed"])
+    i_ch = sum(1 for r in result["ai"] if r["changed"])
+    story.append(Paragraph(
+        f"本組作答：{len(result['answers'])} 個 Session，{a_ch} 個有差異　；　"
+        f"AI 分析：{len(result['ai'])} 個 Session，{i_ch} 個有差異。", body))
+    story.append(Paragraph("標色 = 該行並非所有檔案都有（即分歧處）。", small))
+
+    def section(title: str, rows: list[dict[str, Any]], missing_text: str = "（此檔無此 Session）") -> None:
+        story.append(Paragraph(title, h2))
+        if not rows:
+            story.append(Paragraph("（無資料）", body))
+            return
+        for r in rows:
+            badge = "有差異" if r["changed"] else "相同"
+            color = "#b03a2e" if r["changed"] else "#1e7d4f"
+            label = f"Session {r['session']}" if str(r["session"]).isdigit() else str(r["session"])
+            head = label + (f"・{esc(r['title'])}" if r["title"] else "")
+            story.append(Paragraph(f'{head}　<font color="{color}">[{badge}]</font>', sess))
+
+            data: list[list[Any]] = []
+            for name, col in zip(names, r["cols"]):
+                if col["missing"]:
+                    content = Paragraph(f'<font color="#b03a2e"><i>{esc(missing_text)}</i></font>', body)
+                elif not col["lines"]:
+                    content = Paragraph("（空白）", body)
+                else:
+                    parts = []
+                    for ln in col["lines"]:
+                        t = esc(ln["text"])
+                        parts.append(f'<font backColor="#fff3df">{t}</font>' if ln["kind"] == "diff" else t)
+                    content = Paragraph("<br/>".join(parts), body)
+                data.append([Paragraph(f"<b>{esc(name)}</b>", name_s), content])
+
+            tbl = Table(data, colWidths=[38 * mm, None])
+            tbl.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), font),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d9dde4")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f6f7f9")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            story.append(tbl)
+
+    if result.get("depts"):
+        section("一、組員科部", result["depts"], missing_text="（未填組成科別）")
+        section("二、本組各 Session 作答", result["answers"])
+        section("三、各 Session 的 AI 分析", result["ai"])
+    else:
+        section("一、本組各 Session 作答", result["answers"])
+        section("二、各 Session 的 AI 分析", result["ai"])
+
+    buf = io.BytesIO()
+    SimpleDocTemplate(
+        buf, pagesize=A4, topMargin=16 * mm, bottomMargin=16 * mm,
+        leftMargin=14 * mm, rightMargin=14 * mm, title="AI臨床訓練 Session 總比較",
+    ).build(story)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +414,7 @@ def main() -> None:
             try:
                 files = [(u.name, u.getvalue()) for u in uploads]
                 st.session_state["result"] = analyze_multi(files)
+                st.session_state.pop("pdf_bytes", None)  # 新比較→清掉舊 PDF
             except Exception as exc:  # noqa: BLE001
                 st.error(f"處理失敗：{exc}")
                 return
@@ -272,6 +424,46 @@ def main() -> None:
         return
 
     names = result["names"]
+
+    # 組員科部比較
+    st.subheader("組員科部")
+    dept_rows = result.get("depts") or []
+    if not dept_rows:
+        st.info("上傳的 PDF 未含「組成科別」欄位，無法比較科部。")
+    else:
+        st.caption("標色 = 該科別並非所有組別都有")
+        row = dept_rows[0]
+        dcols = st.columns(len(names))
+        for i, (col_ui, name) in enumerate(zip(dcols, names)):
+            with col_ui:
+                gname = result["meta"][i]["name"] if i < len(result.get("meta", [])) else ""
+                label = esc(name) + (f" <span style='color:#888'>（{esc(gname)}）</span>" if gname else "")
+                st.markdown(
+                    f"<div style='font-weight:700;font-size:13px;padding-bottom:4px'>{label}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(render_col_html(row["cols"][i], COL_TINTS[i % len(COL_TINTS)],
+                                            missing_text="（未填組成科別）"),
+                            unsafe_allow_html=True)
+
+    # 產生 / 下載總比較 PDF
+    st.divider()
+    cA, cB = st.columns([1, 2])
+    with cA:
+        if st.button("產生總比較 PDF", key="mkpdf"):
+            with st.spinner("正在產生 PDF（首次會下載中文字型，約需數秒）…"):
+                try:
+                    st.session_state["pdf_bytes"] = build_pdf_report(result)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"PDF 產生失敗：{exc}")
+    with cB:
+        pdf_bytes = st.session_state.get("pdf_bytes")
+        if pdf_bytes:
+            fname = "AI臨床訓練_Session總比較_" + datetime.now().strftime("%Y%m%d_%H%M") + ".pdf"
+            st.download_button("下載總比較 PDF", data=pdf_bytes, file_name=fname,
+                               mime="application/pdf", key="dlpdf")
+    st.divider()
+
     tab1, tab2, tab3 = st.tabs(["本組作答", "AI 分析", "原始抽出文字"])
     with tab1:
         show_section("本組各 Session 作答", result["answers"], names, "ans")
